@@ -1,0 +1,10 @@
+{
+  "name": "token-meter",
+  "version": "0.1.0",
+  "description": "Banda sobre el prompt con el PR/CI de la rama y un medidor de consumo: coste, subagentes, caché, contexto y límites de uso con proyección.",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "Pablo Val Gimeno"
+  },
+  "repository": "https://github.com/valgimeno/token-meter"
+}

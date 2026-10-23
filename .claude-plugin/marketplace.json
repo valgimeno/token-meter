@@ -1,0 +1,13 @@
+{
+  "name": "valgimeno",
+  "owner": {
+    "name": "Pablo Val Gimeno"
+  },
+  "plugins": [
+    {
+      "name": "token-meter",
+      "source": "./",
+      "description": "Banda sobre el prompt con el PR/CI de la rama y un medidor de consumo: coste, subagentes, caché, contexto y límites de uso con proyección."
+    }
+  ]
+}
