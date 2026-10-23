@@ -127,3 +127,32 @@ export function repoName(remote: string | null, root: string): string {
   const last = src.replace(/\/+$/, '').split(/[/:]/).pop() ?? src
   return last.replace(/\.git$/, '')
 }
+
+/** "ahora", "hace 5 min", "hace 2 h", "hace 3 días". */
+export function ago(ms: number): string {
+  const min = Math.floor(ms / 60_000)
+  if (min < 2) return 'ahora'
+  if (min < 60) return `hace ${min} min`
+  const h = Math.floor(min / 60)
+  if (h < 48) return `hace ${h} h`
+  return `hace ${Math.floor(h / 24)} días`
+}
+
+/** Cuándo empezó la ventana de un límite, a partir de su reinicio. */
+export function windowStart(kind: string, resetsAt?: string): number | null {
+  if (!resetsAt) return null
+  const reset = Date.parse(resetsAt)
+  if (Number.isNaN(reset)) return null
+  if (kind === 'five_hour') return reset - 5 * 3600_000
+  if (kind === 'seven_day') return reset - 7 * 24 * 3600_000
+  return null
+}
+
+export type Spend = { t: number; d: number }
+
+/** Suma lo gastado desde `since` en todos los registros. */
+export function spentSince(ledgers: Spend[][], since: number): number {
+  let total = 0
+  for (const l of ledgers) for (const x of l) if (x.t >= since) total += x.d
+  return total
+}

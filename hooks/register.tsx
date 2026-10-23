@@ -4,15 +4,19 @@ import type { EngineInterface, Register, SessionUsage } from 'claude-code'
 import type { CiState, Limit, RepoInfo, Snapshot, Tokens } from '../types'
 import {
   addSample,
+  ago,
   ciFromRollup,
   inputTotal,
   limitLabel,
   projectFull,
   repoName,
+  spentSince,
   usd,
   weightOf,
   when,
+  windowStart,
   type Sample,
+  type Spend,
 } from './calc'
 
 const snapshot = atom({ plugin: 'token-meter', key: 'snapshot' } as const, null as Snapshot | null)
@@ -28,6 +32,10 @@ const lastUsd = atom({ plugin: 'token-meter', key: 'lastUsd' } as const, null as
 const hideRepo = atom({ plugin: 'token-meter', key: 'hideRepo' } as const, false)
 const showHelp = atom({ plugin: 'token-meter', key: 'showHelp' } as const, true)
 const showChecks = atom({ plugin: 'token-meter', key: 'showChecks' } as const, false)
+const showLegend = atom({ plugin: 'token-meter', key: 'showLegend' } as const, false)
+const tick = atom({ plugin: 'token-meter', key: 'tick' } as const, 0)
+
+let sessionId = ''
 
 type Prefs = { hideRepo?: boolean; showHelp?: boolean }
 type Usage = Pick<SessionUsage, 'context' | 'rateLimits' | 'cost'>
@@ -43,6 +51,24 @@ async function savePrefs($: EngineInterface) {
 async function record($: EngineInterface, u: Usage) {
   const now = await $.clock.now()
 
+  // Registro de gasto de esta sesión, para saber cuánto se gastó en cada ventana.
+  if (u.cost) {
+    const before = await read($, lastUsd)
+    if (before !== null && u.cost.usd > before) {
+      const key = `ledger:${sessionId || 'unknown'}`
+      const prev = ((await $.store.get(key)) as Spend[] | undefined) ?? []
+      const kept = prev.filter(x => now - x.t <= 8 * 24 * 3600_000)
+      await $.store.set(key, [...kept, { t: now, d: u.cost.usd - before }].slice(-5000))
+    }
+  }
+  const ledgers: Spend[][] = []
+  for (const k of await $.store.keys()) {
+    if (!k.startsWith('ledger:')) continue
+    const l = ((await $.store.get(k)) as Spend[] | undefined) ?? []
+    if (l.length > 0 && l.every(x => now - x.t > 8 * 24 * 3600_000)) await $.store.delete(k)
+    else ledgers.push(l)
+  }
+
   const limits: Limit[] = []
   for (const rl of u.rateLimits) {
     const key = `samples:${rl.kind}:${rl.resetsAt ?? ''}`
@@ -54,6 +80,10 @@ async function record($: EngineInterface, u: Usage) {
       percentUsed: rl.percentUsed,
       resetsAt: rl.resetsAt,
       fullAt: projectFull(samples, now, rl.percentUsed),
+      blockUsd: (() => {
+        const start = windowStart(rl.kind, rl.resetsAt)
+        return start === null ? null : spentSince(ledgers, start)
+      })(),
     })
   }
 
@@ -70,12 +100,12 @@ async function record($: EngineInterface, u: Usage) {
     await update($, lastUsd, () => spent)
   }
 
-  const snap: Snapshot = { usd: u.cost?.usd, contextPercent: u.context.percent, limits }
+  const snap: Snapshot = { usd: u.cost?.usd, contextPercent: u.context.percent, limits, measuredAt: now }
   await update($, snapshot, () => snap)
 
-  const parts = ['token-meter']
-  if (snap.usd !== undefined) parts.push(usd(snap.usd))
-  if (snap.contextPercent !== undefined) parts.push(`ctx ${snap.contextPercent}%`)
+  const parts: string[] = []
+  if (snap.usd !== undefined) parts.push(`sesión ${usd(snap.usd)}`)
+  if (snap.contextPercent !== undefined) parts.push(`contexto ${snap.contextPercent}%`)
   $.ui.status(parts.join(' · '))
 }
 
@@ -102,6 +132,7 @@ async function refreshRepo($: EngineInterface) {
     const name = sr ? repoName(sr.remote, sr.root) : 'repo'
 
     let pr: RepoInfo['pr'] = null
+    let prNote: RepoInfo['prNote'] = 'unavailable'
     try {
       const r = await $.process.run(
         ['gh', 'pr', 'view', '--json', 'number,additions,deletions,statusCheckRollup'],
@@ -117,12 +148,15 @@ async function refreshRepo($: EngineInterface) {
           ci,
           checks,
         }
+        prNote = undefined
+      } else if (/no (open )?pull requests? found/i.test(r.stderr)) {
+        prNote = 'none'
       }
     } catch {
       pr = null
     }
 
-    const info: RepoInfo = { name, branch, pr }
+    const info: RepoInfo = { name, branch, pr, prNote }
     await update($, repo, () => info)
     const stored = await $.store.get(branchKey(info))
     await update($, branchUsd, () => (stored === undefined ? null : Number(stored)))
@@ -131,9 +165,10 @@ async function refreshRepo($: EngineInterface) {
   }
 }
 
-// Qué es y por qué importa cada métrica: se muestra al pasar el puntero.
+// Qué es y por qué importa cada métrica: al pasar el puntero, o en la leyenda.
 const HELP: Record<string, string> = {
   pr: 'El pull request abierto desde esta rama: la propuesta de cambios que espera revisión y fusión.',
+  prgh: 'No se pudo preguntar a GitHub por el PR: en este ordenador falta la herramienta gh o no tiene la sesión iniciada (instálala y ejecuta “gh auth login”).',
   diff: 'Líneas añadidas (+) y quitadas (−) por el PR. Cuanto más grande, más cuesta revisarlo.',
   ci: 'Las pruebas automáticas del PR. Verde: se puede fusionar con tranquilidad; rojo: algo se rompió.',
   session:
@@ -148,6 +183,9 @@ const HELP: Record<string, string> = {
     'Cuánto has usado de tu cuota semanal. La flecha estima cuándo la agotarías al ritmo de las últimas 24 h; en rojo si sería antes de que se reinicie.',
   five_hour:
     'Cuánto has usado de tu cuota de 5 horas. La flecha estima cuándo la agotarías a este ritmo; en rojo si sería antes de que se reinicie.',
+  block:
+    'Lo gastado (en coste equivalente) desde que empezó cada ventana, sumando todas tus sesiones con el Mod activo. Te dice cuánto “vale” cada punto de cuota. Aproximado.',
+  age: 'Cuándo llegó el último dato. Las cifras solo se actualizan cuando Claude responde en esta sesión: si es antiguo, escribe algo para refrescarlo.',
 }
 
 const CI_TEXT: Record<CiState, string> = {
@@ -167,19 +205,23 @@ const level = (v: number, warn: number, bad: number) => (v >= bad ? 'error' : v 
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
+    sessionId = await $.session.id()
     const prefs = (await $.store.get('prefs')) as Prefs | undefined
     if (prefs?.hideRepo !== undefined) await update($, hideRepo, () => Boolean(prefs.hideRepo))
     if (prefs?.showHelp !== undefined) await update($, showHelp, () => Boolean(prefs.showHelp))
 
     const u = await $.session.usage()
     if ((await read($, lastUsd)) === null) {
-      // Solo cuenta para la rama lo gastado desde ahora.
+      // Solo cuenta para la rama y las ventanas lo gastado desde ahora.
       const start = u.cost?.usd ?? 0
       await update($, lastUsd, () => start)
     }
     await refreshRepo($)
     await record($, u)
-    $.clock.every(60_000, () => void refreshRepo($))
+    $.clock.every(60_000, () => {
+      void refreshRepo($)
+      void update($, tick, n => n + 1)
+    })
 
     return next(e)
   })
@@ -216,14 +258,19 @@ export const register: Register = on => {
     const isRepoHidden = await read($, hideRepo)
     const isHelpOn = await read($, showHelp)
     const isChecksOn = await read($, showChecks)
+    const isLegendOn = await read($, showLegend)
+    await read($, tick) // redibuja cada minuto, para que "hace X min" avance
+    const now = await $.clock.now()
 
     if (!snap && !r) return next(e)
 
+    // En la terminal el puntero no siempre llega: allí, leyenda con botón.
+    const isTerminal = e.surface === 'terminal'
     const { Box, Text, Button } = $.ui.resolve(e)
-    const shown: string[] = []
+    const shown: { id: string; label: string }[] = []
 
     const metric = (id: string, label: string, value: string, color: string, extra?: string) => {
-      shown.push(id)
+      if (!shown.some(x => x.id === id)) shown.push({ id, label })
       return (
         <Box key={`m-${id}`} hover={{ scope: `tm-${id}` }}>
           <Text dimColor>{label} </Text>
@@ -236,12 +283,16 @@ export const register: Register = on => {
     }
 
     // Fila 1: repositorio, rama, PR y pruebas
-    const repoRow =
-      r && !isRepoHidden ? (
+    let repoRow = null
+    if (r && !isRepoHidden) {
+      const prCell = r.pr
+        ? metric('pr', 'PR', `#${r.pr.number}`, 'success')
+        : r.prNote === 'none'
+          ? metric('pr', 'PR', 'ninguno abierto', 'subtle')
+          : metric('pr', 'PR', 'no se pudo consultar GitHub', 'warning')
+      repoRow = (
         <Box flexWrap="wrap" columnGap={2}>
-          {r.pr
-            ? metric('pr', 'PR', `#${r.pr.number}`, 'success')
-            : metric('pr', 'PR', 'ninguno abierto', 'subtle')}
+          {prCell}
           <Box>
             <Text dimColor>Repo </Text>
             <Text>{r.name}</Text>
@@ -259,8 +310,10 @@ export const register: Register = on => {
           ) : null}
           {r.pr ? metric('ci', 'Pruebas (CI)', CI_TEXT[r.pr.ci], CI_COLOR[r.pr.ci]) : null}
         </Box>
-      ) : null
-    if (r?.pr && !isRepoHidden) shown.push('diff')
+      )
+      if (r.pr) shown.push({ id: 'diff', label: 'Cambios del PR' })
+      if (!r.pr && r.prNote !== 'none') shown.push({ id: 'prgh', label: 'PR: no se pudo consultar GitHub' })
+    }
 
     const checksRow =
       r?.pr && !isRepoHidden && isChecksOn && r.pr.checks.length > 0 ? (
@@ -302,38 +355,67 @@ export const register: Register = on => {
       const isBeforeReset = l.fullAt !== null && (Number.isNaN(reset) || l.fullAt < reset)
       const color = isBeforeReset ? 'error' : level(l.percentUsed, 70, 90)
       const proj = l.fullAt !== null ? ` → 100% ~${when(l.fullAt)}` : ''
+      const spent = l.blockUsd !== null && l.blockUsd > 0 ? ` · ~${usd(l.blockUsd)} gastados` : ''
       const resetText = Number.isNaN(reset) ? '' : ` · reinicio ${when(reset)}`
       const helpId = HELP[l.kind] ? l.kind : 'seven_day'
-      items.push(metric(helpId, limitLabel(l.kind), `${l.percentUsed}%${proj}`, color, resetText))
+      items.push(metric(helpId, limitLabel(l.kind), `${l.percentUsed}%${proj}`, color, `${spent}${resetText}`))
+      if (spent) shown.push({ id: 'block', label: '“~$ gastados” junto a un límite' })
+    }
+    if (snap) {
+      const age = now - snap.measuredAt
+      items.push(metric('age', 'Datos', ago(age), age > 30 * 60_000 ? 'warning' : 'subtle'))
     }
 
     const meterRow = items.length > 0 ? <Box flexWrap="wrap" columnGap={2}>{items as any}</Box> : null
 
-    // Fila 3: la explicación de la métrica bajo el puntero
-    const helpRow = isHelpOn ? (
-      <Box>
-        <Text dimColor>ⓘ </Text>
-        {shown.map(id => (
-          <Box key={`h-${id}`} display="none" hover={{ scope: `tm-${id}`, display: 'flex' }}>
-            <Text>{HELP[id] ?? ''}</Text>
-          </Box>
-        ))}
-        <Text dimColor> (pasa el puntero por una métrica para ver qué es y por qué importa)</Text>
-      </Box>
-    ) : null
+    // Fila 3: explicaciones. Escritorio: la de la métrica bajo el puntero. Terminal: leyenda completa.
+    let helpRow = null
+    if (isTerminal && isLegendOn) {
+      helpRow = (
+        <Box flexDirection="column">
+          {shown.map(x => (
+            <Text>
+              <Text bold>{x.label}: </Text>
+              {HELP[x.id] ?? ''}
+            </Text>
+          ))}
+        </Box>
+      )
+    } else if (!isTerminal && isHelpOn) {
+      helpRow = (
+        <Box>
+          <Text dimColor>ⓘ </Text>
+          {shown.map(x => (
+            <Box key={`h-${x.id}`} display="none" hover={{ scope: `tm-${x.id}`, display: 'flex' }}>
+              <Text>{HELP[x.id] ?? ''}</Text>
+            </Box>
+          ))}
+          <Text dimColor> (pasa el puntero por una métrica para ver qué es y por qué importa)</Text>
+        </Box>
+      )
+    }
 
     // Fila 4: controles
     const controls = (
       <Box columnGap={1} flexWrap="wrap">
-        <Button
-          key="help"
-          plain
-          label={isHelpOn ? 'Ocultar explicaciones' : 'Mostrar explicaciones'}
-          onPress={async () => {
-            await update($, showHelp, v => !v)
-            await savePrefs($)
-          }}
-        />
+        {isTerminal ? (
+          <Button
+            key="legend"
+            plain
+            label={isLegendOn ? 'Ocultar significados' : 'Qué significa cada cosa'}
+            onPress={() => update($, showLegend, v => !v)}
+          />
+        ) : (
+          <Button
+            key="help"
+            plain
+            label={isHelpOn ? 'Ocultar explicaciones' : 'Mostrar explicaciones'}
+            onPress={async () => {
+              await update($, showHelp, v => !v)
+              await savePrefs($)
+            }}
+          />
+        )}
         {r ? (
           <Button
             key="repo"

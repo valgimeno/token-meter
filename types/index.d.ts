@@ -4,12 +4,16 @@ export type Limit = {
   resetsAt?: string
   /** Cuándo se llegaría al 100 % al ritmo reciente (ms), o null si no hay ritmo suficiente. */
   fullAt: number | null
+  /** Coste equivalente gastado desde que empezó esta ventana (todas las sesiones), o null si no se sabe. */
+  blockUsd: number | null
 }
 
 export type Snapshot = {
   usd?: number
   contextPercent?: number
   limits: Limit[]
+  /** Cuándo se tomó la medición (ms). */
+  measuredAt: number
 }
 
 export type Tokens = {
@@ -28,6 +32,8 @@ export type Check = { name: string; state: CiState }
 export type RepoInfo = {
   name: string
   branch: string
+  /** Por qué no hay PR: no existe, o no se pudo consultar GitHub (falta gh o no tiene sesión). */
+  prNote?: 'none' | 'unavailable'
   pr: {
     number: number
     additions: number
@@ -48,6 +54,8 @@ declare module 'claude-code' {
       hideRepo: boolean
       showHelp: boolean
       showChecks: boolean
+      showLegend: boolean
+      tick: number
     }
   }
 }
